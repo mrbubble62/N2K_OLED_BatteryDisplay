@@ -82,6 +82,7 @@
     <None Include="N2K_OLED_BatteryDisplay.ino">
       <FileType>CppCode</FileType>
     </None>
+    <None Include="README.md" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Adafruit_mfGFX.h" />

@@ -16,6 +16,7 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="N2K_OLED_BatteryDisplay.ino" />
+    <None Include="README.md" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="__vm\.N2K_OLED_BatteryDisplay.vsarduino.h">
