@@ -13,7 +13,9 @@ Also displays engine RPM, Oil pressure and temperature, time in EST sync from GP
 * CAN transceiver
 
 ## Pins
+
 Display 4-Wire Serial SPI 
+
 | OLED | ESP32 |
 |-----|----|
 |RES|19|
