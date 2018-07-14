@@ -1,3 +1,4 @@
+#include "TimeZone.h"
 #define ARDUINO_ARCH_ESP32 
 #define EEPROM_ADDR_CONFIG 0 // starting eeprom address for config params
 #define ESP32_CAN_TX_PIN GPIO_NUM_14
@@ -15,11 +16,21 @@
 #include <print.h>
 #include "fonts.h"
 #include "ESP8266_SSD1322.h"
+#include "TimeZone.h"
 
-unsigned long lastTime = millis();
-unsigned long timePassed;
-byte i = 0;
+//byte i = 0;
 
+float volts = 0;
+float amps = 0;
+float V = 0;
+float A = 0;
+uint16_t rpm;
+float oilTemp;
+float oilPressure;
+float waterTemp;
+
+long timer1;
+bool blink;
 
 // 23 SDA MOSI
 // 18 CLK
@@ -36,9 +47,14 @@ time_t N2KDate(uint16_t DaysSince1970) {
 	return DaysSince1970 * 24 * 3600;
 }
 
+// https://github.com/JChristensen/Timezone
+TimeChangeRule usEDT = { "EDT", Second, Sun, Mar, 2, -240 };  //UTC - 4 hours
+TimeChangeRule usEST = { "EST", First, Sun, Nov, 2, -300 };   //UTC - 5 hours
+Timezone myTZ(usEDT, usEST);
+
 // EEPROM **********************
 // EEPROM configuration structure
-#define MAGIC 12348 // EPROM struct version check, change this whenever tConfig structure changes
+#define MAGIC 12349 // EPROM struct version check, change this whenever tConfig structure changes
 struct tConfig {
 	uint16_t Magic; //test if eeprom initialized
 	double Zero;
@@ -56,7 +72,7 @@ const tConfig defConfig PROGMEM = {
 	MAGIC,
 	0, // zero
 	1,  // unity gain
-	0, // battery
+	0, // battery instance
 	0,	// deviceInstance
 	6 // sourceAddr
 };
@@ -113,10 +129,7 @@ void setup() {
 	// init done
 	display.Set_Gray_Scale_Table();
 	display.clearDisplay();
-	//display.print("OK");
 	display.display();
-	//display.clearDisplay();
-	//delay(500);
 
 	NMEA2000.EnableForward(false);
 	NMEA2000.SetProductInformation("07062018", // Manufacturer's Model serial code
@@ -128,28 +141,18 @@ void setup() {
 	//// Det device information
 	//NMEA2000.SetHeartbeatInterval(config.HeartbeatInterval);
 	NMEA2000.SetDeviceInformation(70618, // Unique number. Use e.g. Serial number.
-		130, // Device function=Temperature See codes on http://www.nmea.org/Assets/20120726%20nmea%202000%20class%20%26%20function%20codes%20v%202.00.pdf
-		120, // Device class=Sensor Communication Interface. See codes on http://www.nmea.org/Assets/20120726%20nmea%202000%20class%20%26%20function%20codes%20v%202.00.pdf
-		2040 // Just choosen free from code list on http://www.nmea.org/Assets/20121020%20nmea%202000%20registration%20list.pdf                               
+		130, // Device function
+		120, // Device class
+		2040 // Test registration number                        
 	);
 	NMEA2000.SetMode(tNMEA2000::N2km_ListenAndNode, config.sourceAddr);
 	NMEA2000.ExtendTransmitMessages(TransmitMessages);
 	NMEA2000.ExtendReceiveMessages(ReceiveMessage);
-	NMEA2000.SetN2kCANMsgBufSize(5);
+	NMEA2000.SetN2kCANMsgBufSize(100);
 	NMEA2000.SetMsgHandler(HandleNMEA2000Msg);
 	NMEA2000.Open();
-	//delay(2000);
-
 }
 
-float volts = 12.7;
-float amps = 0;
-float V = 12.7;
-float A = 0;
-uint16_t rpm;
-float oilTemp;
-float oilPressure;
-float waterTemp;
 
 // check voltage thresholds, change according to battery chemistry
 void vsim() {
@@ -163,15 +166,14 @@ void vsim() {
 }
 
 
-uint16_t g = 0;
-
-void displayVA(uint8_t h, float A, float V)
+void displayVA(uint8_t h, float A, float V, bool invaliddata)
 {
 	display.setFont(NIXI);
 	display.setFontKern(-5);
 	display.setTextColor(WHITE);
 	display.setCursor(0, h);
-	display.print(V, 1);
+	if(invaliddata) display.print("--.-");
+	else display.print(V, 1);
 	display.setCursor(85, h + 12);
 	display.setFont(NIXI20);
 	display.print("V");
@@ -181,17 +183,21 @@ void displayVA(uint8_t h, float A, float V)
 		display.setCursor(115, h);
 	else
 		display.setCursor(130, h);
-	if (abs(A) > 99.99)
-		display.print(A, 0);
-	else if (abs(A) > 9.99)
-		display.print(A, 1);
-	else
-		display.print(A, 2);
+	if (invaliddata) display.print("-.--");
+	else {
+		if (abs(A) > 99.99)
+			display.print(A, 0);
+		else if (abs(A) > 9.99)
+			display.print(A, 1);
+		else
+			display.print(A, 2);
+	}
 	display.setCursor(h + 12);
 	display.setFont(NIXI20);
 	display.setFontKern(2);
 	display.print("A");
 }
+
 void displayRPM(uint8_t x, uint8_t y, uint16_t rpm)
 {
 	display.setFont(GLCDFONT);
@@ -200,6 +206,7 @@ void displayRPM(uint8_t x, uint8_t y, uint16_t rpm)
 	display.print("RPM ");
 	display.print(rpm);
 }
+
 void displayPSI(uint8_t x, uint8_t y, uint16_t psi, String lable = "")
 {
 	display.setFont(GLCDFONT);
@@ -219,15 +226,16 @@ void displayTemp(uint8_t x, uint8_t y, float t, String lable = "")
 	display.print("*F");
 }
 
-long timer1;
-bool blink;
 // loop controls
 uint32_t delt_t = 0; // 250 ms loop
 uint32_t count = 0; // 250 ms loop
 long slowloop = 0; // 1s loop
-				   // USB serial commands
-bool SDEBUG = true; // toggle debug print
+long staleDataTimer = 255; // increments every second while no battery data received
+
+// USB serial commands
+bool SDEBUG = false; // toggle debug print
 bool SDATA = false; // toggle data print
+
 
 void loop() {
 	char command = getCommand();
@@ -251,22 +259,22 @@ void loop() {
 		
 		//draw new values and if voltage < 11.60 and discharing then blink
 		if (V < 11.60 && A < 0) {
-			if (timer1 > 1000) { timer1 = 0; blink = !blink; }
+			blink = !blink;
 		}
 		else if (V > 15.60 && A > 0) {
-			if (timer1 > 1000) { timer1 = 0; blink = !blink; }
+			 blink = !blink; 
 		}
 		else {
 			blink = false;
 		}
 		//**** Update Display *****
-		//blink if 
-		if (!blink) displayVA(5, A, V);
-		//
+		if (!blink) displayVA(5, A, V, (staleDataTimer>5)?true:false);
 		displayRPM(3, 52, rpm);
-		displayTemp(62, 52, oilTemp, "Eng:");
-		displayPSI(130, 52, oilPressure, "Oil:");
-		displayTemp(195, 52,waterTemp, "Water:");
+		displayPSI(60, 52, oilPressure, "Oil:");
+		display.print(" ");
+		display.print(oilTemp, 0);
+		display.print("*F  ");
+		PrintTime(myTZ.toLocal(now()));
 		display.display();
 		//erase
 		display.clearDisplay();
@@ -276,7 +284,6 @@ void loop() {
 		
 		SetN2kDCBatStatus(N2kMsg, 1, 12.5, 1.511, 243.21, SID);
 		NMEA2000.SendMsg(N2kMsg);
-
 		slowloop++;
 	}
 	// 1000ms
@@ -302,6 +309,7 @@ void SlowLoop() {
 		UpdateConfig();
 	}
 	digitalWrite(LED_BUILTIN, HIGH);
+	staleDataTimer++;
 }
 
 //*****************************************************************************
@@ -346,23 +354,6 @@ void printDebug() {
 	Serial.print(" ");
 }
 
-void PrintConfig() {
-	Serial.print("Center zero offset: ");
-	//Serial.print(offsetVoltage);
-	Serial.print("V\n");
-	Serial.print("Gain: ");
-	//Serial.print(gain, 6);
-	Serial.println("\n");
-}
-
-void PrintHelp()
-{
-	Serial.println(F("Mr Bubble Rudder Reference"));
-	Serial.println(F("Commands: \"p\"=show data, \"d\"=show ADC voltages, \"z\"=save current position as zero reference, \"+\"=ingrease gain,\"-\"=decrease gain, \"w\"=save gain setting to EEPROM"));
-	Serial.println(F("Alignment: Center the wheel and press 'z' to align the rudder reference, turn to 90 degrees and use the + and - keys to adjust gain"));
-}
-
-
 void SystemTime(const tN2kMsg &N2kMsg) {
 	unsigned char SID;
 	uint16_t SystemDate;
@@ -378,18 +369,11 @@ void SystemTime(const tN2kMsg &N2kMsg) {
 		if (time) {
 			NetTime = time;
 			setTime(NetTime);
-			//setTime(t);
-			//digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
 		}
 		else {
 			// time is off by 60s so invalidate nettime
 			if (abs(NetTime - now()) > 60) NetTime = 0;
 		}
-		// serial print time
-	/*	if (STIME) {
-			Serial.print("Last Network time:"); PrintDateTime(NetTime); PrintN2kEnumType(TimeSource, OutputStream);
-			Serial.print("\nCurrent local time:"); PrintDateTime(now());
-		}*/
 	}
 	else {
 		OutputStream->print(F("Failed to parse SystemTime PGN: ")); OutputStream->println(N2kMsg.PGN);
@@ -430,6 +414,7 @@ void EngineDynamicParameters(const tN2kMsg &N2kMsg) {
 		EngineCoolantPress, EngineFuelPress,
 		EngineLoad, EngineTorque)) {
 		oilPressure = EngineOilPress;
+		oilTemp = EngineOilTemp;
 		PrintLabelValWithConversionCheckUnDef("Engine dynamic params: ", EngineInstance, 0, true);
 		PrintLabelValWithConversionCheckUnDef("  oil pressure (Pa): ", EngineOilPress, 0, true);
 		PrintLabelValWithConversionCheckUnDef("  oil temp (C): ", EngineOilTemp, &KelvinToC, true);
@@ -522,8 +507,13 @@ void DCBatStatus(const tN2kMsg &N2kMsg) {
 	double tempK;
 	if (ParseN2kDCBatStatus(N2kMsg, BatteryInstance, voltage, amperes, tempK,SID))
 	{
-		volts = voltage;
-		amps = amperes;
+		if (SDEBUG) { Serial.print("BatteryInstance:"); Serial.println(BatteryInstance); }
+		if (BatteryInstance == config.batteryInstance)
+		{
+			volts = voltage;
+			amps = amperes;
+			staleDataTimer = 0;
+		}
 	}
 }
 
@@ -575,4 +565,13 @@ void PrintDateTime(time_t t) {
 	display.print(":");
 	PrintDigits(second(t));
 	display.print(" GMT ");
+}
+
+void PrintTime(time_t t) {
+	PrintDigits(hour(t));
+	display.print(":");
+	PrintDigits(minute(t));
+	display.print(":");
+	PrintDigits(second(t));
+	display.print(" EST");
 }

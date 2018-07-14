@@ -30,6 +30,9 @@
     <ClInclude Include="ESP8266_SSD1322.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="TimeZone.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="fonts.cpp">
@@ -39,6 +42,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="ESP8266_SSD1322.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="TimeZone.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
