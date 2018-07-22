@@ -26,6 +26,9 @@ uint16_t rpm;
 float oilTemp;
 float oilPressure;
 float waterTemp;
+uint8_t Brightness = 15;
+uint8_t startX = 0;
+String msg = "";
 
 // Debugging Serial 
 Stream *OutputStream;
@@ -66,7 +69,7 @@ Timezone myTZ(usEDT, usEST);
 
 // EEPROM **********************
 // EEPROM configuration structure
-#define MAGIC 12351 // EPROM struct version check, change this whenever tConfig structure changes
+#define MAGIC 12352 // EPROM struct version check, change this whenever tConfig structure changes
 struct tConfig {
 	uint16_t Magic; //test if eeprom initialized
 	uint8_t batteryInstance;
@@ -115,7 +118,18 @@ tNMEA2000Handler NMEA2000Handlers[] = {
 //NMEA 2000 message handler
 void HandleNMEA2000Msg(const tN2kMsg &N2kMsg) {
 	int iHandler;
-	// Find handler
+	
+	// dump PGN data to display
+	/*
+	const unsigned char *pData = N2kMsg.Data;
+	String msg = "";
+	for (int i = 0; i<N2kMsg.DataLen; i++) {
+		if (i>0) { msg+=(F(",")); };
+		msg += String(pData[i], HEX);
+	}
+	newMsg(String(N2kMsg.PGN) + " " + String(N2kMsg.Source) + " " + String(N2kMsg.Destination) + " " + msg);
+	*/
+
 	//OutputStream->print("In Main Handler: "); OutputStream->println(N2kMsg.PGN);
 	for (iHandler = 0; NMEA2000Handlers[iHandler].PGN != 0 && !(N2kMsg.PGN == NMEA2000Handlers[iHandler].PGN); iHandler++);
 	if (NMEA2000Handlers[iHandler].PGN != 0) {
@@ -166,8 +180,10 @@ void setup() {
 	NMEA2000.SetN2kCANMsgBufSize(100);
 	NMEA2000.SetMsgHandler(HandleNMEA2000Msg);
 	NMEA2000.Open();
+	clearMsgBuffer();
+	newMsg("Message log:");
+	SetMsg("1234567890 ABCDEFG 1234567890 abcdefg 12345 qwerty");
 }
-
 
 // main loop
 void loop() {
@@ -205,25 +221,29 @@ void loop() {
 			blink = false;
 		}
 
-		//**** Update Display *****
-		if (!blink) displayVA(5, A, V, (batteryDataValid > STALEDATATIME) ? true : false);
+		// scroll message
+		horizontalScroll();
 
-		displayRPM(3, 52, rpm, (engineDataValid > STALEDATATIME) ? true : false);
-		if (engineDataValid <= STALEDATATIME) {
-			displayPSI(60, 52, oilPressure, false, "Oil:");
-			displayTemp(0,0,oilTemp, false," @");
-		}
-		else
-		{
-			displayPSI(60, 52, oilPressure, true, "Oil:");
-			displayTemp(0, 0, oilTemp, true, " @");
+		if (!SDATA) {
+			//**** Update Display *****
+			if (!blink) displayVA(5, A, V, (batteryDataValid > STALEDATATIME) ? true : false);
+			displayRPM(3, 52, rpm, (engineDataValid > STALEDATATIME) ? true : false);
+			if (engineDataValid <= STALEDATATIME) {
+				displayPSI(60, 52, oilPressure, false, "Oil:");
+				displayTemp(0, 0, oilTemp, false, " @");
+			}
+			else
+			{
+				displayPSI(60, 52, oilPressure, true, "Oil:");
+				displayTemp(0, 0, oilTemp, true, " @");
+			}
+			if (timeDataValid < 255) {
+				PrintTime(myTZ.toLocal(now()));
+				//PrintDate(myTZ.toLocal(now()));
+			}
+			display.display();
 		}
 
-		if (timeDataValid < 255) {
-			PrintTime(myTZ.toLocal(now()));
-			//PrintDate(myTZ.toLocal(now()));
-		}
-		display.display();
 		//erase
 		display.clearDisplay();
 		//****** end display  ********
@@ -234,6 +254,8 @@ void loop() {
 		}
 		if (SDATA) {
 			printDebug();
+			SetMsg("1234567890");
+			//showMessage("Test message");
 		}
 		
 		SetN2kDCBatStatus(N2kMsg, 1, 12.5, 1.511, 243.21, SID);
@@ -247,6 +269,8 @@ void loop() {
 
 // slow message loop
 void SlowLoop() {
+	//newMsg(DateTimeString(now()));
+
 	// Slow loop N2K message processing
 	// check my address 
 	if (config.sourceAddr != NMEA2000.GetN2kSource()) {
@@ -303,7 +327,7 @@ void displayVA(uint8_t h, float A, float V, bool invaliddata)
 void displayRPM(uint8_t x, uint8_t y, uint16_t rpm, bool invaliddata)
 {
 	display.setFont(GLCDFONT);
-	display.setTextColor(WHITE);
+	display.setTextColor(Brightness);
 	if (x>0 || y>0)	display.setCursor(x, y);
 	display.print("RPM:");
 	if (invaliddata) display.print("----");
@@ -313,7 +337,7 @@ void displayRPM(uint8_t x, uint8_t y, uint16_t rpm, bool invaliddata)
 void displayPSI(uint8_t x, uint8_t y, uint16_t psi, bool invaliddata, String lable = "")
 {
 	display.setFont(GLCDFONT);
-	display.setTextColor(WHITE);
+	display.setTextColor(Brightness);
 	if (x>0 || y>0)	display.setCursor(x, y);
 	if (lable.length()>0) display.print(lable);
 	if (invaliddata) display.print("-- ");
@@ -423,6 +447,7 @@ void EngineRapid(const tN2kMsg &N2kMsg) {
 		OutputStream->print("Failed to parse PGN: "); OutputStream->println(N2kMsg.PGN);
 	}
 }
+
 inline double PascalToPSI(double v) { return v * 0.000145038; }
 
 void EngineDynamicParameters(const tN2kMsg &N2kMsg) {
@@ -573,17 +598,28 @@ void vsim() {
 	if (amps > 40) amps = 40;
 }
 
+String printDigits(int digits) {
+	 
+	if (digits < 10)
+		return '0' + String(digits);
+	else
+	return String(digits);
+}
+
+String DateTimeString(time_t t) {
+	return String(year(t)) + "-" + String(month(t)) + "-" + String(day(t))
+		+ " " + printDigits(hour(t)) + ":" + printDigits(minute(t)) + ":" + printDigits(second(t));
+}
+
 // pad zeros for time format
 void PrintDigits(int digits) {
 	if (digits < 10)
 		display.print('0');
 	display.print(digits);
 }
+
 // print datetime
 void PrintDateTime(time_t t) {
-	
-	// display the given time
-	display.print(" ");
 	display.print(year(t));
 	display.print("-");
 	display.print(month(t));
@@ -607,11 +643,94 @@ void PrintDate(time_t t) {
 	display.print(year(t)-2000);
 }
 void PrintTime(time_t t) {
-	display.print(" Time:");
+	display.print("  Time ");
 	PrintDigits(hour(t));
 	display.print(":");
 	PrintDigits(minute(t));
 	display.print(":");
 	PrintDigits(second(t));
-	display.print("EST");
+//	display.print(" EST");
+}
+
+void showMessage(String msg) {
+	display.setFont(GLCDFONT);
+	display.setTextColor(Brightness);
+
+	display.setCursor(0, 0);
+	display.clearDisplay();
+	for (int a = 1; a < 16; a++) {
+		display.setTextColor(a);
+		display.print(" ");
+		display.print(a);
+		display.print(".");
+		for (int i = 0; i < msg.length(); i++) {
+			
+			display.print(msg[i]);
+			display.display();
+			delay(10);
+		}
+		delay(100);
+	}
+	delay(5000);
+}
+
+String msgbuffer[8];
+uint8_t msgIndex = 0;
+void newMsg(String msg)
+{
+	//display is 42 chars wide with GLCDFONT
+	msgbuffer[msgIndex] = msg.substring(0, 40);
+	msgIndex++;
+	if (msgIndex > 7) msgIndex = 0;
+	msgToDisplay();
+}
+
+void clearMsgBuffer()
+{
+	for (int i = 0; i < 8; i++) {
+		msgbuffer[i] = "";
+	}
+}
+
+// vertical scroll messages
+void msgToDisplay()
+{
+	display.clearDisplay();
+	display.setCursor(0,0);
+	uint8_t start = msgIndex;
+	for (int i = start; i < 8; i++) {
+		display.println(msgbuffer[i]);
+	}
+	for (int i = 0; i < start; i++) {
+		display.println(msgbuffer[i]);
+	}
+	display.display();
+}
+
+void SetMsg(String text)
+{
+	msg = "                                       " + text;
+}
+
+void horizontalScroll()
+{
+	display.setCursor(0, 42);
+	display.setFont(GLCDFONT);
+	display.setTextColor(Brightness);
+	char c;
+	uint8_t out = 0;
+	uint8_t len = msg.length();
+	if (len < 40) msg += " ";
+	for (int x = startX; x < startX + 40; x++) {
+		display.print(msg[x]);
+		out++;
+	}
+	if (out < 39) {
+		display.print(" ");
+		for (int x = out; x < 40; x++) {
+			display.print(msg[x - out]);
+		}
+	}
+	startX++;
+	if (startX > len) startX = 0;
 }
