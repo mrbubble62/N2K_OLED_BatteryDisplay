@@ -18,8 +18,6 @@
 #include "ESP8266_SSD1322.h"
 #include "TimeZone.h"
 
-//byte i = 0;
-
 float volts = 0;
 float amps = 0;
 float V = 0;
@@ -29,24 +27,38 @@ float oilTemp;
 float oilPressure;
 float waterTemp;
 
-long timer1;
-bool blink;
+// Debugging Serial 
+Stream *OutputStream;
+// Debugging toggles
+bool SDEBUG = false; // toggle debug print
+bool SDATA = false; // toggle data print
 
+uint32_t delt_t = 0; // 250 ms loop
+uint32_t count = 0; // 250 ms loop
+long slowloop = 0; // 1s loop
+//long staleDataTimer = 255; // increments every second while no battery data received
+#define STALEDATATIME 5  // seconds before invalidating displayed data
+long batteryDataValid = 255;
+long engineDataValid = 255;
+long timeDataValid = 255;
+bool blink; // battery display warning flash
+
+// SSD1322 Display **************
 // 23 SDA MOSI
 // 18 CLK
-#define OLED_CS     17  // Pin 10, CS - Chip select
-#define OLED_DC     5  // Pin 9 - DC digital signal
-#define OLED_RESET  19   // using hardware !RESET from Arduino instead
-
+#define OLED_CS     17  // CS - Chip select
+#define OLED_DC     5   // DC digital signal
+#define OLED_RESET  19  // Originally pin 16 but froze on CAN RX
 //hardware SPI - only way to go. Can get 110 FPS
 ESP8266_SSD1322 display(OLED_DC, OLED_RESET, OLED_CS);
 
-time_t NetTime = 0;  //NMEA network time is invalid
+// Clock *******************
+time_t NetTime = 0;  //0 = NMEA network time is invalid
 // convert N2K days since1970 to unix time seconds since 1970
 time_t N2KDate(uint16_t DaysSince1970) {
 	return DaysSince1970 * 24 * 3600;
 }
-
+// Timezone rules
 // https://github.com/JChristensen/Timezone
 TimeChangeRule usEDT = { "EDT", Second, Sun, Mar, 2, -240 };  //UTC - 4 hours
 TimeChangeRule usEST = { "EST", First, Sun, Nov, 2, -300 };   //UTC - 5 hours
@@ -54,11 +66,9 @@ Timezone myTZ(usEDT, usEST);
 
 // EEPROM **********************
 // EEPROM configuration structure
-#define MAGIC 12349 // EPROM struct version check, change this whenever tConfig structure changes
+#define MAGIC 12351 // EPROM struct version check, change this whenever tConfig structure changes
 struct tConfig {
 	uint16_t Magic; //test if eeprom initialized
-	double Zero;
-	double Gain;
 	uint8_t batteryInstance;
 	uint8_t deviceInstance;
 	uint8_t sourceAddr;
@@ -70,16 +80,12 @@ tConfig config;
 // Default EEPROM contents
 const tConfig defConfig PROGMEM = {
 	MAGIC,
-	0, // zero
-	1,  // unity gain
-	0, // battery instance
-	0,	// deviceInstance
-	6 // sourceAddr
+	1, // battery instance (default in my Battery monitor)
+	0, // deviceInstance
+	6  // sourceAddr
 };
 
-Stream *OutputStream;
-
-//*****************************************************************************
+// N2K *****************************************************************************
 tN2kMsg N2kMsg; // N2K message constructor
 int SID = 1;
 
@@ -89,7 +95,7 @@ typedef struct {
 	void(*Handler)(const tN2kMsg &N2kMsg);
 } tNMEA2000Handler;
 
-const unsigned long ReceiveMessage[] PROGMEM = { 126992L,127488L,127489L,127508L,130312L,0 }; //systemtime,EngineRapid,EngineDynamicParameters,DCBatStatus,Temperature,Pressure
+const unsigned long ReceiveMessage[] PROGMEM = { 126992L,127488L,127489L,127508L,0 }; //systemtime,EngineRapid,EngineDynamicParameters,DCBatStatus,Temperature,Pressure
 const unsigned long TransmitMessages[] PROGMEM = { 127508L, 0 }; //Battery DC State
 
 void SystemTime(const tN2kMsg &N2kMsg);
@@ -97,14 +103,12 @@ void EngineRapid(const tN2kMsg &N2kMsg);
 void EngineDynamicParameters(const tN2kMsg &N2kMsg);
 void DCBatStatus(const tN2kMsg &N2kMsg);
 void BatteryConfigurationStatus(const tN2kMsg &N2kMsg);
-void Temperature(const tN2kMsg &N2kMsg);
 
 tNMEA2000Handler NMEA2000Handlers[] = {
 	{ 126992L,&SystemTime },
 	{ 127488L,&EngineRapid },
 	{ 127489L,&EngineDynamicParameters },
 	{ 127508L,&DCBatStatus },
-	{ 130312L,&Temperature },
 	{ 0,0 }
 };
 
@@ -119,11 +123,22 @@ void HandleNMEA2000Msg(const tN2kMsg &N2kMsg) {
 	}
 }
 
+void displayVA(uint8_t h, float A, float V, bool invaliddata);
+void displayRPM(uint8_t x, uint8_t y, uint16_t rpm, bool invaliddata);
+void displayPSI(uint8_t x, uint8_t y, uint16_t psi, bool invaliddata, String lable);
+void displayTemp(uint8_t x, uint8_t y, float t, bool invaliddata, String lable);
+
 void setup() {
 	Serial.begin(115200);
 	Serial.println("STARTING");
 	OutputStream = &Serial;
-
+	ReadConfig();
+	if (config.Magic != MAGIC) {
+		InitializeEEPROM();
+		Serial.println(F("EEPROM invalid, initializing..\n"));
+		delay(500);
+	}
+	
 	// Initialize display and perform reset
 	display.begin(true);
 	// init done
@@ -136,112 +151,33 @@ void setup() {
 		666, // Manufacturer's product code
 		"Battery Display",  // Manufacturer's Model ID
 		"1.0.0.1 (2015-08-14)",  // Manufacturer's Software version code
-		"1.0.0.0 (2015-08-14)" // Manufacturer's Model version
+		"1.0.0.0 (2015-08-14)", // Manufacturer's Model version
+		config.deviceInstance
 	);
-	//// Det device information
-	//NMEA2000.SetHeartbeatInterval(config.HeartbeatInterval);
 	NMEA2000.SetDeviceInformation(70618, // Unique number. Use e.g. Serial number.
 		130, // Device function
 		120, // Device class
-		2040 // Test registration number                        
+		2040, // Test registration number
+		config.deviceInstance
 	);
 	NMEA2000.SetMode(tNMEA2000::N2km_ListenAndNode, config.sourceAddr);
-	NMEA2000.ExtendTransmitMessages(TransmitMessages);
-	NMEA2000.ExtendReceiveMessages(ReceiveMessage);
+	NMEA2000.ExtendTransmitMessages(TransmitMessages, config.deviceInstance);
+	NMEA2000.ExtendReceiveMessages(ReceiveMessage, config.deviceInstance);
 	NMEA2000.SetN2kCANMsgBufSize(100);
 	NMEA2000.SetMsgHandler(HandleNMEA2000Msg);
 	NMEA2000.Open();
 }
 
 
-// check voltage thresholds, change according to battery chemistry
-void vsim() {
-	volts = volts + ((random(10) - 5.0) / 10);
-	if (volts > 16.0) volts = 16.0;
-	if (volts < 10.5) volts = 10.5;
-
-	amps = amps + ((random(8) - 3.5) / 2.0);
-	if (amps < -140) amps = -140;
-	if (amps > 40) amps = 40;
-}
-
-
-void displayVA(uint8_t h, float A, float V, bool invaliddata)
-{
-	display.setFont(NIXI);
-	display.setFontKern(-5);
-	display.setTextColor(WHITE);
-	display.setCursor(0, h);
-	if(invaliddata) display.print("--.-");
-	else display.print(V, 1);
-	display.setCursor(85, h + 12);
-	display.setFont(NIXI20);
-	display.print("V");
-	display.setFont(NIXI);
-	display.setFontKern(0);
-	if (A < 0)
-		display.setCursor(115, h);
-	else
-		display.setCursor(130, h);
-	if (invaliddata) display.print("-.--");
-	else {
-		if (abs(A) > 99.99)
-			display.print(A, 0);
-		else if (abs(A) > 9.99)
-			display.print(A, 1);
-		else
-			display.print(A, 2);
-	}
-	display.setCursor(h + 12);
-	display.setFont(NIXI20);
-	display.setFontKern(2);
-	display.print("A");
-}
-
-void displayRPM(uint8_t x, uint8_t y, uint16_t rpm)
-{
-	display.setFont(GLCDFONT);
-	display.setTextColor(WHITE);
-	display.setCursor(x, y);
-	display.print("RPM ");
-	display.print(rpm);
-}
-
-void displayPSI(uint8_t x, uint8_t y, uint16_t psi, String lable = "")
-{
-	display.setFont(GLCDFONT);
-	display.setTextColor(WHITE);
-	display.setCursor(x, y);
-	if (lable.length()>0) display.print(lable);
-	display.print(psi);
-	display.print("psi");
-}
-void displayTemp(uint8_t x, uint8_t y, float t, String lable = "")
-{
-	display.setFont(GLCDFONT);
-	display.setTextColor(WHITE);
-	display.setCursor(x, y);
-	if (lable.length()>0) display.print(lable);
-	display.print(t, 0);
-	display.print("*F");
-}
-
-// loop controls
-uint32_t delt_t = 0; // 250 ms loop
-uint32_t count = 0; // 250 ms loop
-long slowloop = 0; // 1s loop
-long staleDataTimer = 255; // increments every second while no battery data received
-
-// USB serial commands
-bool SDEBUG = false; // toggle debug print
-bool SDATA = false; // toggle data print
-
-
+// main loop
 void loop() {
 	char command = getCommand();
 	switch (command) {
-	case 'd':
+	case 'd': // toggle debug
 		SDEBUG = !SDEBUG;
+		break;
+	case 'p': //toggle serial printing
+		SDATA = !SDATA;
 		break;
 	default:
 		break;
@@ -256,31 +192,49 @@ void loop() {
 		//slight damping
 		V = (V + volts) / 2;
 		A = (A + amps) / 2;
-		
+
+		// Warning voltage thresholds should change according to battery chemistry
 		//draw new values and if voltage < 11.60 and discharing then blink
-		if (V < 11.60 && A < 0) {
+		if (V < 11.60 && A < 0) { // excess discharge warning - 11.60 for flooded cell
 			blink = !blink;
 		}
-		else if (V > 15.60 && A > 0) {
-			 blink = !blink; 
+		else if (V > 15.60 && A > 0) { // excess charging voltage warning
+			blink = !blink;
 		}
 		else {
 			blink = false;
 		}
+
 		//**** Update Display *****
-		if (!blink) displayVA(5, A, V, (staleDataTimer>5)?true:false);
-		displayRPM(3, 52, rpm);
-		displayPSI(60, 52, oilPressure, "Oil:");
-		display.print(" ");
-		display.print(oilTemp, 0);
-		display.print("*F  ");
-		PrintTime(myTZ.toLocal(now()));
+		if (!blink) displayVA(5, A, V, (batteryDataValid > STALEDATATIME) ? true : false);
+
+		displayRPM(3, 52, rpm, (engineDataValid > STALEDATATIME) ? true : false);
+		if (engineDataValid <= STALEDATATIME) {
+			displayPSI(60, 52, oilPressure, false, "Oil:");
+			displayTemp(0,0,oilTemp, false," @");
+		}
+		else
+		{
+			displayPSI(60, 52, oilPressure, true, "Oil:");
+			displayTemp(0, 0, oilTemp, true, " @");
+		}
+
+		if (timeDataValid < 255) {
+			PrintTime(myTZ.toLocal(now()));
+			//PrintDate(myTZ.toLocal(now()));
+		}
 		display.display();
 		//erase
 		display.clearDisplay();
 		//****** end display  ********
 		// debug
-		if (SDEBUG) { amps = amps + 0.01; }
+		if (SDEBUG) {
+			amps = amps + 0.01; 
+			batteryDataValid = 0;
+		}
+		if (SDATA) {
+			printDebug();
+		}
 		
 		SetN2kDCBatStatus(N2kMsg, 1, 12.5, 1.511, 243.21, SID);
 		NMEA2000.SendMsg(N2kMsg);
@@ -309,8 +263,75 @@ void SlowLoop() {
 		UpdateConfig();
 	}
 	digitalWrite(LED_BUILTIN, HIGH);
-	staleDataTimer++;
+	batteryDataValid++;
+	engineDataValid++;
+	timeDataValid++;
 }
+
+void displayVA(uint8_t h, float A, float V, bool invaliddata)
+{
+	display.setFont(NIXI);
+	display.setFontKern(-5);
+	display.setTextColor(WHITE);
+	display.setCursor(0, h);
+	if (invaliddata) display.print("--.-");
+	else display.print(V, 1);
+	display.setCursor(85, h + 12);
+	display.setFont(NIXI20);
+	display.print("V");
+	display.setFont(NIXI);
+	display.setFontKern(0);
+	if (A < 0)
+		display.setCursor(115, h);
+	else
+		display.setCursor(130, h);
+	if (invaliddata) display.print("-.--");
+	else {
+		if (abs(A) > 99.99)
+			display.print(A, 0);
+		else if (abs(A) > 9.99)
+			display.print(A, 1);
+		else
+			display.print(A, 2);
+	}
+	display.setCursor(h + 12);
+	display.setFont(NIXI20);
+	display.setFontKern(2);
+	display.print("A");
+}
+
+void displayRPM(uint8_t x, uint8_t y, uint16_t rpm, bool invaliddata)
+{
+	display.setFont(GLCDFONT);
+	display.setTextColor(WHITE);
+	if (x>0 || y>0)	display.setCursor(x, y);
+	display.print("RPM:");
+	if (invaliddata) display.print("----");
+	else display.print(rpm);
+}
+
+void displayPSI(uint8_t x, uint8_t y, uint16_t psi, bool invaliddata, String lable = "")
+{
+	display.setFont(GLCDFONT);
+	display.setTextColor(WHITE);
+	if (x>0 || y>0)	display.setCursor(x, y);
+	if (lable.length()>0) display.print(lable);
+	if (invaliddata) display.print("-- ");
+	else display.print(psi);
+	display.print("psi");
+}
+
+void displayTemp(uint8_t x, uint8_t y, float t, bool invaliddata, String lable = "")
+{
+	display.setFont(GLCDFONT);
+	display.setTextColor(WHITE);
+	if (x>0 || y>0)	display.setCursor(x, y);
+	if (lable.length()>0) display.print(lable);
+	if (invaliddata) display.print("--");
+	else display.print(t, 0);
+	display.print("F");
+}
+
 
 //*****************************************************************************
 template<typename T> void PrintLabelValWithConversionCheckUnDef(const char* label, T val, double(*ConvFunc)(double val) = 0, bool AddLf = false) {
@@ -354,6 +375,7 @@ void printDebug() {
 	Serial.print(" ");
 }
 
+// N2K message parsing
 void SystemTime(const tN2kMsg &N2kMsg) {
 	unsigned char SID;
 	uint16_t SystemDate;
@@ -363,8 +385,9 @@ void SystemTime(const tN2kMsg &N2kMsg) {
 	const unsigned long DEFAULT_TIME = 1357041600; // Jan 1 2013 
 	if (ParseN2kSystemTime(N2kMsg, SID, SystemDate, SystemTime, TimeSource)) {
 		time = SystemDate * 3600 * 24 + SystemTime;
+		timeDataValid = 0;
 		if (time < DEFAULT_TIME) { // check the value is a valid time (greater than Jan 1 2013)
-			time = 0L; // return 0 to indicate that the time is not valid
+			time = 0L; // return to 0 indicate that the time is not valid
 		}
 		if (time) {
 			NetTime = time;
@@ -379,6 +402,7 @@ void SystemTime(const tN2kMsg &N2kMsg) {
 		OutputStream->print(F("Failed to parse SystemTime PGN: ")); OutputStream->println(N2kMsg.PGN);
 	}
 }
+
 void EngineRapid(const tN2kMsg &N2kMsg) {
 	unsigned char EngineInstance;
 	double EngineSpeed;
@@ -387,15 +411,20 @@ void EngineRapid(const tN2kMsg &N2kMsg) {
 
 	if (ParseN2kEngineParamRapid(N2kMsg, EngineInstance, EngineSpeed, EngineBoostPressure, EngineTiltTrim)) {
 		rpm = EngineSpeed;
-	//	PrintLabelValWithConversionCheckUnDef("Engine rapid params: ", EngineInstance, 0, true);
-		PrintLabelValWithConversionCheckUnDef("  RPM: ", EngineSpeed, 0, true);
-	//	PrintLabelValWithConversionCheckUnDef("  boost pressure (Pa): ", EngineBoostPressure, 0, true);
-	//	PrintLabelValWithConversionCheckUnDef("  tilt trim: ", EngineTiltTrim, 0, true);
+		engineDataValid = 0;
+		if (SDEBUG) {
+			PrintLabelValWithConversionCheckUnDef("Engine rapid params: ", EngineInstance, 0, true);
+			PrintLabelValWithConversionCheckUnDef("  RPM: ", EngineSpeed, 0, true);
+			PrintLabelValWithConversionCheckUnDef("  boost pressure (Pa): ", EngineBoostPressure, 0, true);
+			PrintLabelValWithConversionCheckUnDef("  tilt trim: ", EngineTiltTrim, 0, true);
+		}
 	}
 	else {
 		OutputStream->print("Failed to parse PGN: "); OutputStream->println(N2kMsg.PGN);
 	}
 }
+inline double PascalToPSI(double v) { return v * 0.000145038; }
+
 void EngineDynamicParameters(const tN2kMsg &N2kMsg) {
 	unsigned char EngineInstance;
 	double EngineOilPress;
@@ -413,39 +442,25 @@ void EngineDynamicParameters(const tN2kMsg &N2kMsg) {
 		AltenatorVoltage, FuelRate, EngineHours,
 		EngineCoolantPress, EngineFuelPress,
 		EngineLoad, EngineTorque)) {
-		oilPressure = EngineOilPress;
-		oilTemp = EngineOilTemp;
-		PrintLabelValWithConversionCheckUnDef("Engine dynamic params: ", EngineInstance, 0, true);
-		PrintLabelValWithConversionCheckUnDef("  oil pressure (Pa): ", EngineOilPress, 0, true);
-		PrintLabelValWithConversionCheckUnDef("  oil temp (C): ", EngineOilTemp, &KelvinToC, true);
-		PrintLabelValWithConversionCheckUnDef("  coolant temp (C): ", EngineCoolantTemp, &KelvinToC, true);
-		PrintLabelValWithConversionCheckUnDef("  altenator voltage (V): ", AltenatorVoltage, 0, true);
-		PrintLabelValWithConversionCheckUnDef("  fuel rate (l/h): ", FuelRate, 0, true);
-		PrintLabelValWithConversionCheckUnDef("  engine hours (h): ", EngineHours, &SecondsToh, true);
-		//PrintLabelValWithConversionCheckUnDef("  coolant pressure (Pa): ", EngineCoolantPress, 0, true);
-		PrintLabelValWithConversionCheckUnDef("  fuel pressure (Pa): ", EngineFuelPress, 0, true);
-		//PrintLabelValWithConversionCheckUnDef("  engine load (%): ", EngineLoad, 0, true);
-		//PrintLabelValWithConversionCheckUnDef("  engine torque (%): ", EngineTorque, 0, true);
+		oilPressure = PascalToPSI(EngineOilPress);
+		oilTemp = KelvinToF(EngineOilTemp);
+		engineDataValid = 0;
+		if (SDEBUG) {
+			PrintLabelValWithConversionCheckUnDef("Engine dynamic params: ", EngineInstance, 0, true);
+			PrintLabelValWithConversionCheckUnDef("  oil pressure (Pa): ", EngineOilPress, 0, true);
+			PrintLabelValWithConversionCheckUnDef("  oil temp (C): ", EngineOilTemp, &KelvinToC, true);
+			PrintLabelValWithConversionCheckUnDef("  coolant temp (C): ", EngineCoolantTemp, &KelvinToC, true);
+			PrintLabelValWithConversionCheckUnDef("  altenator voltage (V): ", AltenatorVoltage, 0, true);
+			PrintLabelValWithConversionCheckUnDef("  fuel rate (l/h): ", FuelRate, 0, true);
+			PrintLabelValWithConversionCheckUnDef("  engine hours (h): ", EngineHours, &SecondsToh, true);
+			PrintLabelValWithConversionCheckUnDef("  coolant pressure (Pa): ", EngineCoolantPress, 0, true);
+			PrintLabelValWithConversionCheckUnDef("  fuel pressure (Pa): ", EngineFuelPress, 0, true);
+			PrintLabelValWithConversionCheckUnDef("  engine load (%): ", EngineLoad, 0, true);
+			PrintLabelValWithConversionCheckUnDef("  engine torque (%): ", EngineTorque, 0, true);
+		}
 	}
 	else {
 		OutputStream->print("Failed to parse PGN: "); OutputStream->println(N2kMsg.PGN);
-	}
-}
-
-void Temperature(const tN2kMsg &N2kMsg) {
-	unsigned char SID;
-	unsigned char TempInstance;
-	tN2kTempSource TempSource;
-	double ActualTemperature;
-	double SetTemperature;
-
-	if (ParseN2kTemperature(N2kMsg, SID, TempInstance, TempSource, ActualTemperature, SetTemperature)) {
-		OutputStream->print("Temperature source: "); PrintN2kEnumType(TempSource, OutputStream, false);
-		PrintLabelValWithConversionCheckUnDef(", actual temperature: ", ActualTemperature, &KelvinToC);
-		PrintLabelValWithConversionCheckUnDef(", set temperature: ", SetTemperature, &KelvinToC, true);
-	}
-	else {
-		OutputStream->print("Failed to parse PGN: ");  OutputStream->println(N2kMsg.PGN);
 	}
 }
 
@@ -475,6 +490,7 @@ void BatteryConfigurationStatus(const tN2kMsg &N2kMsg) {
 		OutputStream->print("Failed to parse PGN: "); OutputStream->println(N2kMsg.PGN);
 	}
 }
+
 void DCStatus(const tN2kMsg &N2kMsg) {
 	unsigned char SID;
 	unsigned char DCInstance;
@@ -498,7 +514,6 @@ void DCStatus(const tN2kMsg &N2kMsg) {
 	}
 }
 
-
 void DCBatStatus(const tN2kMsg &N2kMsg) {
 	unsigned char SID;
 	unsigned char BatteryInstance;
@@ -507,17 +522,22 @@ void DCBatStatus(const tN2kMsg &N2kMsg) {
 	double tempK;
 	if (ParseN2kDCBatStatus(N2kMsg, BatteryInstance, voltage, amperes, tempK,SID))
 	{
-		if (SDEBUG) { Serial.print("BatteryInstance:"); Serial.println(BatteryInstance); }
+		if (SDEBUG) { 
+			OutputStream->print("Battery Instance: ");
+			OutputStream->println(BatteryInstance);
+			OutputStream->print("  - voltage: "); OutputStream->print(voltage);
+			OutputStream->print("V  - amperes: "); OutputStream->print(amperes);
+			OutputStream->print("A  - temp: "); OutputStream->print(tempK);
+			OutputStream->print("K");
+		}
 		if (BatteryInstance == config.batteryInstance)
 		{
 			volts = voltage;
 			amps = amperes;
-			staleDataTimer = 0;
+			batteryDataValid = 0;
 		}
 	}
 }
-
-
 
 //*****************************************************************************
 // LED blinker count flashes in duration ms
@@ -540,6 +560,17 @@ char getCommand()
 		c = Serial.read();
 	}
 	return c;
+}
+
+// debug voltage simulation 
+void vsim() {
+	volts = volts + ((random(10) - 5.0) / 10);
+	if (volts > 16.0) volts = 16.0;
+	if (volts < 10.5) volts = 10.5;
+
+	amps = amps + ((random(8) - 3.5) / 2.0);
+	if (amps < -140) amps = -140;
+	if (amps > 40) amps = 40;
 }
 
 // pad zeros for time format
@@ -567,11 +598,20 @@ void PrintDateTime(time_t t) {
 	display.print(" GMT ");
 }
 
+void PrintDate(time_t t) {
+	display.print(" ");
+	PrintDigits(month(t));
+	display.print("/");
+	PrintDigits(day(t));
+	display.print("/");
+	display.print(year(t)-2000);
+}
 void PrintTime(time_t t) {
+	display.print(" Time:");
 	PrintDigits(hour(t));
 	display.print(":");
 	PrintDigits(minute(t));
 	display.print(":");
 	PrintDigits(second(t));
-	display.print(" EST");
+	display.print("EST");
 }
