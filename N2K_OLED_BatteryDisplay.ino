@@ -1,6 +1,7 @@
+//BOARD WEMOS LoLin32
 #include "TimeZone.h"
-#define ARDUINO_ARCH_ESP32 
-#define EEPROM_ADDR_CONFIG 0 // starting eeprom address for config params
+//#define ARDUINO_ARCH_ESP32 
+#define EEPROM_ADDR_CONFIG 10 // starting eeprom address for config params
 #define ESP32_CAN_TX_PIN GPIO_NUM_14
 #define ESP32_CAN_RX_PIN GPIO_NUM_12
 
@@ -10,7 +11,9 @@
 #include <N2kMessagesEnumToStr.h>
 #include <SPI.h>
 #include <string.h>
-#include <EEPROM.h>
+//#include <EEPROM.h>
+#include <Preferences.h>
+
 #include <Time.h>
 #include <TimeLib.h>
 #include <print.h>
@@ -70,15 +73,19 @@ Timezone myTZ(usEDT, usEST);
 // EEPROM **********************
 // EEPROM configuration structure
 #define MAGIC 12352 // EPROM struct version check, change this whenever tConfig structure changes
-struct tConfig {
+typedef struct {
 	uint16_t Magic; //test if eeprom initialized
 	uint8_t batteryInstance;
 	uint8_t deviceInstance;
 	uint8_t sourceAddr;
-};
+} tConfig;
 
 // EEPROM contents
+Preferences EEPROM;
 tConfig config;
+
+
+
 
 // Default EEPROM contents
 const tConfig defConfig PROGMEM = {
@@ -141,6 +148,8 @@ void displayVA(uint8_t h, float A, float V, bool invaliddata);
 void displayRPM(uint8_t x, uint8_t y, uint16_t rpm, bool invaliddata);
 void displayPSI(uint8_t x, uint8_t y, uint16_t psi, bool invaliddata, String lable);
 void displayTemp(uint8_t x, uint8_t y, float t, bool invaliddata, String lable);
+void displayTime(uint8_t x, uint8_t y, time_t t, String lable);
+
 
 void setup() {
 	Serial.begin(115200);
@@ -148,12 +157,21 @@ void setup() {
 	OutputStream = &Serial;
 	ReadConfig();
 	if (config.Magic != MAGIC) {
-		InitializeEEPROM();
+		Serial.print("MAGIC");
+		Serial.println(config.Magic);
 		Serial.println(F("EEPROM invalid, initializing..\n"));
-		delay(500);
+		InitializeEEPROM();
+		delay(200);
+		Serial.println(F("Done.\n"));
+
 	}
-	
+	else {
+		Serial.println(F("Loaded saved config\n"));
+		Serial.print("SRC:"); Serial.println(config.sourceAddr);
+		Serial.print("INST:"); Serial.println(config.deviceInstance);
+	}
 	// Initialize display and perform reset
+	Serial.println(F("Initialize display"));
 	display.begin(true);
 	// init done
 	display.Set_Gray_Scale_Table();
@@ -182,7 +200,8 @@ void setup() {
 	NMEA2000.Open();
 	clearMsgBuffer();
 	newMsg("Message log:");
-	SetMsg("1234567890 ABCDEFG 1234567890 abcdefg 12345 qwerty");
+	SetMsg("");
+	Serial.println(F("Begin loop\n"));
 }
 
 // main loop
@@ -238,7 +257,8 @@ void loop() {
 				displayTemp(0, 0, oilTemp, true, " @");
 			}
 			if (timeDataValid < 255) {
-				PrintTime(myTZ.toLocal(now()));
+				//PrintTime(myTZ.toLocal(now()));
+				displayTime(60, 70, myTZ.toLocal(now()), " ");
 				//PrintDate(myTZ.toLocal(now()));
 			}
 			display.display();
@@ -270,7 +290,7 @@ void loop() {
 // slow message loop
 void SlowLoop() {
 	//newMsg(DateTimeString(now()));
-
+	Serial.println(F("."));
 	// Slow loop N2K message processing
 	// check my address 
 	if (config.sourceAddr != NMEA2000.GetN2kSource()) {
@@ -355,6 +375,20 @@ void displayTemp(uint8_t x, uint8_t y, float t, bool invaliddata, String lable =
 	else display.print(t, 0);
 	display.print("F");
 }
+void displayTime(uint8_t x, uint8_t y, time_t t,String lable = "")
+{
+	display.setFont(GLCDFONT);
+	display.setTextColor(WHITE);
+	if (x>0 || y>0)	display.setCursor(x, y);
+	if (lable.length()>0) display.print(lable);
+	
+	PrintDigits(hour(t));
+	display.print(":");
+	PrintDigits(minute(t));
+	display.print(":");
+	PrintDigits(second(t));
+}
+
 
 
 //*****************************************************************************
@@ -371,15 +405,17 @@ template<typename T> void PrintLabelValWithConversionCheckUnDef(const char* labe
 // EEPROM *****************************************************************************
 //Load From EEPROM 
 void ReadConfig() {
-	EEPROM.get(EEPROM_ADDR_CONFIG, config);
+	EEPROM.begin("config");
+	EEPROM.getBytes("config", &config, sizeof(config));
+	//EEPROM.get(EEPROM_ADDR_CONFIG, config);
 }
 
 //Write to EEPROM - Teensy non-volatile area size is 2048 bytes  100,000 cycles
 void UpdateConfig() {
 	Blink(5, 2000);
 	Serial.println("Updating config");
-	config.Magic = MAGIC;
-	EEPROM.put(EEPROM_ADDR_CONFIG, config);
+	EEPROM.putBytes("config", &config, sizeof(config)); //ESP32 Preferences
+	//EEPROM.put(EEPROM_ADDR_CONFIG, config);  //Teensy EEPROM
 }
 
 // Load default config into EEPROM
