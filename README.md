@@ -4,6 +4,8 @@ Displays Voltage and current for battery instance (stored in eeprom)
 
 Also displays engine RPM, Oil pressure and temperature, time in EST sync from GPS
 
+![test](batterydisplay.jpg?raw=true){:height="150" width="300px"}.
+
 ## Parts list:
 
 * ESP32 (Lolin NANO32)

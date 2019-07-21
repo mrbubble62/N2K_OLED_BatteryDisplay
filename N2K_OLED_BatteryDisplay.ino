@@ -1,5 +1,5 @@
 //BOARD WEMOS LoLin32
-#include "TimeZone.h"
+
 //#define ARDUINO_ARCH_ESP32 
 #define EEPROM_ADDR_CONFIG 10 // starting eeprom address for config params
 #define ESP32_CAN_TX_PIN GPIO_NUM_14
@@ -11,15 +11,26 @@
 #include <N2kMessagesEnumToStr.h>
 #include <SPI.h>
 #include <string.h>
-//#include <EEPROM.h>
-#include <Preferences.h>
-
+//#include <EEPROM.h> // Teensy
+#include <Preferences.h> // ESP32 NVS
 #include <Time.h>
 #include <TimeLib.h>
+#include "TimeZone.h"
 #include <print.h>
 #include "fonts.h"
 #include "ESP8266_SSD1322.h"
 #include "TimeZone.h"
+
+#define AUTOIDDEVICES 1 // automatically detect engine and battery instance for vessels with only one motor and one battery
+#define BATTERYINSTANCE 1
+#define ENGINEINSTANCE 1
+
+// Timezone rules
+// https://github.com/JChristensen/Timezone
+TimeChangeRule usEDT = { "EDT", Second, Sun, Mar, 2, -240 };  //UTC - 4 hours
+TimeChangeRule usEST = { "EST", First, Sun, Nov, 2, -300 };   //UTC - 5 hours
+Timezone myTZ(usEDT, usEST);
+
 
 float volts = 0;
 float amps = 0;
@@ -35,6 +46,7 @@ String msg = "";
 
 // Debugging Serial 
 Stream *OutputStream;
+
 // Debugging toggles
 bool SDEBUG = false; // toggle debug print
 bool SDATA = false; // toggle data print
@@ -42,7 +54,7 @@ bool SDATA = false; // toggle data print
 uint32_t delt_t = 0; // 250 ms loop
 uint32_t count = 0; // 250 ms loop
 long slowloop = 0; // 1s loop
-//long staleDataTimer = 255; // increments every second while no battery data received
+
 #define STALEDATATIME 5  // seconds before invalidating displayed data
 long batteryDataValid = 255;
 long engineDataValid = 255;
@@ -55,42 +67,38 @@ bool blink; // battery display warning flash
 #define OLED_CS     17  // CS - Chip select
 #define OLED_DC     5   // DC digital signal
 #define OLED_RESET  19  // Originally pin 16 but froze on CAN RX
-//hardware SPI - only way to go. Can get 110 FPS
+
 ESP8266_SSD1322 display(OLED_DC, OLED_RESET, OLED_CS);
 
 // Clock *******************
 time_t NetTime = 0;  //0 = NMEA network time is invalid
-// convert N2K days since1970 to unix time seconds since 1970
+
+// convert N2K days since1970 to unix time seconds since 1970					
 time_t N2KDate(uint16_t DaysSince1970) {
 	return DaysSince1970 * 24 * 3600;
 }
-// Timezone rules
-// https://github.com/JChristensen/Timezone
-TimeChangeRule usEDT = { "EDT", Second, Sun, Mar, 2, -240 };  //UTC - 4 hours
-TimeChangeRule usEST = { "EST", First, Sun, Nov, 2, -300 };   //UTC - 5 hours
-Timezone myTZ(usEDT, usEST);
 
 // EEPROM **********************
+Preferences EEPROM;
+
 // EEPROM configuration structure
 #define MAGIC 12352 // EPROM struct version check, change this whenever tConfig structure changes
 typedef struct {
 	uint16_t Magic; //test if eeprom initialized
 	uint8_t batteryInstance;
-	uint8_t deviceInstance;
-	uint8_t sourceAddr;
+	uint8_t	engineInstance;
+	uint8_t deviceInstance;  // changed by MFD
+	uint8_t sourceAddr;  //NMEA 2000 source address negoitaited
 } tConfig;
 
 // EEPROM contents
-Preferences EEPROM;
 tConfig config;
-
-
-
 
 // Default EEPROM contents
 const tConfig defConfig PROGMEM = {
 	MAGIC,
-	1, // battery instance (default in my Battery monitor)
+	BATTERYINSTANCE, // battery instance (default in my Battery monitor)
+	ENGINEINSTANCE,
 	0, // deviceInstance
 	6  // sourceAddr
 };
@@ -125,19 +133,6 @@ tNMEA2000Handler NMEA2000Handlers[] = {
 //NMEA 2000 message handler
 void HandleNMEA2000Msg(const tN2kMsg &N2kMsg) {
 	int iHandler;
-	
-	// dump PGN data to display
-	/*
-	const unsigned char *pData = N2kMsg.Data;
-	String msg = "";
-	for (int i = 0; i<N2kMsg.DataLen; i++) {
-		if (i>0) { msg+=(F(",")); };
-		msg += String(pData[i], HEX);
-	}
-	newMsg(String(N2kMsg.PGN) + " " + String(N2kMsg.Source) + " " + String(N2kMsg.Destination) + " " + msg);
-	*/
-
-	//OutputStream->print("In Main Handler: "); OutputStream->println(N2kMsg.PGN);
 	for (iHandler = 0; NMEA2000Handlers[iHandler].PGN != 0 && !(N2kMsg.PGN == NMEA2000Handlers[iHandler].PGN); iHandler++);
 	if (NMEA2000Handlers[iHandler].PGN != 0) {
 		NMEA2000Handlers[iHandler].Handler(N2kMsg);
@@ -149,7 +144,6 @@ void displayRPM(uint8_t x, uint8_t y, uint16_t rpm, bool invaliddata);
 void displayPSI(uint8_t x, uint8_t y, uint16_t psi, bool invaliddata, String lable);
 void displayTemp(uint8_t x, uint8_t y, float t, bool invaliddata, String lable);
 void displayTime(uint8_t x, uint8_t y, time_t t, String lable);
-
 
 void setup() {
 	Serial.begin(115200);
@@ -163,12 +157,13 @@ void setup() {
 		InitializeEEPROM();
 		delay(200);
 		Serial.println(F("Done.\n"));
-
 	}
 	else {
 		Serial.println(F("Loaded saved config\n"));
 		Serial.print("SRC:"); Serial.println(config.sourceAddr);
 		Serial.print("INST:"); Serial.println(config.deviceInstance);
+		Serial.print("BAT:"); Serial.println(config.batteryInstance);
+		Serial.print("ENG:"); Serial.println(config.engineInstance);
 	}
 	// Initialize display and perform reset
 	Serial.println(F("Initialize display"));
@@ -201,7 +196,7 @@ void setup() {
 	clearMsgBuffer();
 	newMsg("Message log:");
 	SetMsg("");
-	Serial.println(F("Begin loop\n"));
+	Serial.println(F("Begin main loop\n"));
 }
 
 // main loop
@@ -232,12 +227,15 @@ void loop() {
 		//draw new values and if voltage < 11.60 and discharing then blink
 		if (V < 11.60 && A < 0) { // excess discharge warning - 11.60 for flooded cell
 			blink = !blink;
+			SetMsg("!!! Low Battery !!!");
 		}
 		else if (V > 15.60 && A > 0) { // excess charging voltage warning
 			blink = !blink;
+			SetMsg("!!! Excess charging voltage !!!");
 		}
 		else {
 			blink = false;
+			SetMsg("");
 		}
 
 		// scroll message
@@ -257,9 +255,10 @@ void loop() {
 				displayTemp(0, 0, oilTemp, true, " @");
 			}
 			if (timeDataValid < 255) {
-				//PrintTime(myTZ.toLocal(now()));
-				displayTime(60, 70, myTZ.toLocal(now()), " ");
-				//PrintDate(myTZ.toLocal(now()));
+				displayTime(0, 0, myTZ.toLocal(now()), " Time ");
+			}
+			else {
+				display.print("      NO GPS");
 			}
 			display.display();
 		}
@@ -269,7 +268,7 @@ void loop() {
 		//****** end display  ********
 		// debug
 		if (SDEBUG) {
-			amps = amps + 0.01; 
+			amps = amps + 0.01;
 			batteryDataValid = 0;
 		}
 		if (SDATA) {
@@ -277,9 +276,7 @@ void loop() {
 			SetMsg("1234567890");
 			//showMessage("Test message");
 		}
-		
-		SetN2kDCBatStatus(N2kMsg, 1, 12.5, 1.511, 243.21, SID);
-		NMEA2000.SendMsg(N2kMsg);
+
 		slowloop++;
 	}
 	// 1000ms
@@ -289,8 +286,6 @@ void loop() {
 
 // slow message loop
 void SlowLoop() {
-	//newMsg(DateTimeString(now()));
-	Serial.println(F("."));
 	// Slow loop N2K message processing
 	// check my address 
 	if (config.sourceAddr != NMEA2000.GetN2kSource()) {
@@ -336,7 +331,7 @@ void displayVA(uint8_t h, float A, float V, bool invaliddata)
 		else if (abs(A) > 9.99)
 			display.print(A, 1);
 		else
-			display.print(A, 2);
+			display.print(A, 1);
 	}
 	display.setCursor(h + 12);
 	display.setFont(NIXI20);
@@ -375,20 +370,19 @@ void displayTemp(uint8_t x, uint8_t y, float t, bool invaliddata, String lable =
 	else display.print(t, 0);
 	display.print("F");
 }
-void displayTime(uint8_t x, uint8_t y, time_t t,String lable = "")
+
+void displayTime(uint8_t x, uint8_t y, time_t t, String lable = "")
 {
 	display.setFont(GLCDFONT);
 	display.setTextColor(WHITE);
 	if (x>0 || y>0)	display.setCursor(x, y);
 	if (lable.length()>0) display.print(lable);
-	
 	PrintDigits(hour(t));
 	display.print(":");
 	PrintDigits(minute(t));
 	display.print(":");
 	PrintDigits(second(t));
 }
-
 
 
 //*****************************************************************************
@@ -406,15 +400,15 @@ template<typename T> void PrintLabelValWithConversionCheckUnDef(const char* labe
 //Load From EEPROM 
 void ReadConfig() {
 	EEPROM.begin("config");
-	EEPROM.getBytes("config", &config, sizeof(config));
-	//EEPROM.get(EEPROM_ADDR_CONFIG, config);
+	EEPROM.getBytes("config", &config, sizeof(config)); //ESP32 NVS Preferences
+	//EEPROM.get(EEPROM_ADDR_CONFIG, config); // Teensy EEPROM
 }
 
 //Write to EEPROM - Teensy non-volatile area size is 2048 bytes  100,000 cycles
 void UpdateConfig() {
 	Blink(5, 2000);
 	Serial.println("Updating config");
-	EEPROM.putBytes("config", &config, sizeof(config)); //ESP32 Preferences
+	EEPROM.putBytes("config", &config, sizeof(config)); //ESP32 NVS Preferences
 	//EEPROM.put(EEPROM_ADDR_CONFIG, config);  //Teensy EEPROM
 }
 
@@ -428,7 +422,7 @@ void InitializeEEPROM() {
 // Debug print **************
 void printDebug() {
 	Serial.print("Voltage: ");
-	Serial.print(volts,4);
+	Serial.print(volts, 4);
 	Serial.print("Current: ");
 	Serial.print(amps, 4);
 	Serial.print("V Rel: ");
@@ -454,7 +448,7 @@ void SystemTime(const tN2kMsg &N2kMsg) {
 			setTime(NetTime);
 		}
 		else {
-			// time is off by 60s so invalidate nettime
+			// time is now off by 60s so invalidate nettime
 			if (abs(NetTime - now()) > 60) NetTime = 0;
 		}
 	}
@@ -470,8 +464,16 @@ void EngineRapid(const tN2kMsg &N2kMsg) {
 	int8_t EngineTiltTrim;
 
 	if (ParseN2kEngineParamRapid(N2kMsg, EngineInstance, EngineSpeed, EngineBoostPressure, EngineTiltTrim)) {
-		rpm = EngineSpeed;
-		engineDataValid = 0;
+		if (EngineInstance == config.engineInstance) {
+			rpm = EngineSpeed;
+			engineDataValid = 0;
+		}
+		else {
+			if (engineDataValid > 60 && AUTOIDDEVICES) {
+				config.engineInstance = EngineInstance;
+				UpdateConfig();
+			}
+		}
 		if (SDEBUG) {
 			PrintLabelValWithConversionCheckUnDef("Engine rapid params: ", EngineInstance, 0, true);
 			PrintLabelValWithConversionCheckUnDef("  RPM: ", EngineSpeed, 0, true);
@@ -581,9 +583,9 @@ void DCBatStatus(const tN2kMsg &N2kMsg) {
 	double voltage;
 	double amperes;
 	double tempK;
-	if (ParseN2kDCBatStatus(N2kMsg, BatteryInstance, voltage, amperes, tempK,SID))
+	if (ParseN2kDCBatStatus(N2kMsg, BatteryInstance, voltage, amperes, tempK, SID))
 	{
-		if (SDEBUG) { 
+		if (SDEBUG) {
 			OutputStream->print("Battery Instance: ");
 			OutputStream->println(BatteryInstance);
 			OutputStream->print("  - voltage: "); OutputStream->print(voltage);
@@ -596,6 +598,12 @@ void DCBatStatus(const tN2kMsg &N2kMsg) {
 			volts = voltage;
 			amps = amperes;
 			batteryDataValid = 0;
+		}
+		else {
+			if (batteryDataValid > 60 && AUTOIDDEVICES) {
+				config.batteryInstance = BatteryInstance;
+				UpdateConfig();
+			}
 		}
 	}
 }
@@ -635,11 +643,11 @@ void vsim() {
 }
 
 String printDigits(int digits) {
-	 
+
 	if (digits < 10)
 		return '0' + String(digits);
 	else
-	return String(digits);
+		return String(digits);
 }
 
 String DateTimeString(time_t t) {
@@ -676,7 +684,7 @@ void PrintDate(time_t t) {
 	display.print("/");
 	PrintDigits(day(t));
 	display.print("/");
-	display.print(year(t)-2000);
+	display.print(year(t) - 2000);
 }
 void PrintTime(time_t t) {
 	display.print("  Time ");
@@ -685,7 +693,7 @@ void PrintTime(time_t t) {
 	PrintDigits(minute(t));
 	display.print(":");
 	PrintDigits(second(t));
-//	display.print(" EST");
+	//	display.print(" EST");
 }
 
 void showMessage(String msg) {
@@ -700,7 +708,7 @@ void showMessage(String msg) {
 		display.print(a);
 		display.print(".");
 		for (int i = 0; i < msg.length(); i++) {
-			
+
 			display.print(msg[i]);
 			display.display();
 			delay(10);
@@ -732,7 +740,7 @@ void clearMsgBuffer()
 void msgToDisplay()
 {
 	display.clearDisplay();
-	display.setCursor(0,0);
+	display.setCursor(0, 0);
 	uint8_t start = msgIndex;
 	for (int i = start; i < 8; i++) {
 		display.println(msgbuffer[i]);
@@ -770,3 +778,4 @@ void horizontalScroll()
 	startX++;
 	if (startX > len) startX = 0;
 }
+
