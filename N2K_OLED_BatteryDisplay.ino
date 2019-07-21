@@ -82,7 +82,7 @@ time_t N2KDate(uint16_t DaysSince1970) {
 Preferences EEPROM;
 
 // EEPROM configuration structure
-#define MAGIC 12352 // EPROM struct version check, change this whenever tConfig structure changes
+#define MAGIC 12353 // EPROM struct version check, change this whenever tConfig structure changes
 typedef struct {
 	uint16_t Magic; //test if eeprom initialized
 	uint8_t batteryInstance;
