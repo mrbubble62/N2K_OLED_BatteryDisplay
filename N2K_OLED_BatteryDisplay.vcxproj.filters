@@ -17,6 +17,7 @@
   <ItemGroup>
     <None Include="N2K_OLED_BatteryDisplay.ino" />
     <None Include="README.md" />
+    <None Include=".gitignore" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="__vm\.N2K_OLED_BatteryDisplay.vsarduino.h">
@@ -48,5 +49,10 @@
     <ClCompile Include="TimeZone.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <Image Include="batterydisplay.jpg">
+      <Filter>Resource Files</Filter>
+    </Image>
   </ItemGroup>
 </Project>
